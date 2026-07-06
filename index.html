@@ -28,20 +28,13 @@
 <body>
 <div class="container">
     <h1>📊 Conversor de Relatórios Aghuse — MP</h1>
-    <p class="desc">Envie o PDF do Aghuse (relatório de atendimentos). O sistema lê o conteúdo real do PDF diretamente no navegador (sem servidor, sem dependência externa de dados) e gera a planilha Excel no formato do relatório do Ministério Público.</p>
-    <ul class="rules">
-        <li>Cabeçalho de página (título da unidade e período) é descartado automaticamente</li>
-        <li>Imagem/logo do relatório é ignorada</li>
-        <li>A segunda tabela (resumo "Classificação de Risco x Total" no fim do PDF) é descartada</li>
-        <li>A coluna <b>Idade</b> (após a coluna Cor) é removida</li>
-        <li>Linhas sem diagnóstico preenchido são descartadas</li>
-        <li>Nome do paciente é reduzido à letra inicial (padrão do relatório MP)</li>
-    </ul>
-
+    <p class="desc">Envie o PDF do Aghuse. Versão corrigida com isolamento estrito de idade para linhas sem diagnóstico.</p>
+    
     <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
         <p>📥 Clique aqui ou arraste o arquivo PDF do Aghuse</p>
         <input type="file" id="fileInput" accept=".pdf" style="display:none">
     </div>
+    
     <div id="loading">
         ⏳ Lendo e estruturando o relatório...
         <div class="progress-wrap"><div class="progress-bar" id="progressBar"></div></div>
@@ -56,10 +49,10 @@
         <p>• <b>Páginas lidas:</b> <span id="lblPages"></span></p>
         <p>• <b>Total de registros válidos extraídos:</b> <span id="lblTotal" style="font-weight:bold; color:#16a34a;"></span> pacientes.</p>
         <p>• <b>Linhas descartadas (diagnóstico vazio):</b> <span id="lblSkipped"></span></p>
-        <p>• <b>Nomes dos pacientes:</b> mantida apenas a primeira letra inicial.</p>
         <button id="btnDownload" class="btn-download">📥 Baixar Planilha Excel (.XLSX)</button>
     </div>
 </div>
+
 <script>
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
 
@@ -74,12 +67,34 @@
     const btnDownload = document.getElementById('btnDownload');
     let blobExcel = null;
 
-    // ---- Configuração de layout do relatório Aghuse (JasperReports) ----
-    // Limites de coluna (em pontos, espaço de visualização da página já rotacionada)
     const COL_BOUNDS = [20, 87, 154, 221, 288, 355, 422, 489, 556, 623, 690, 756, 822];
-    const NUM_COLS = 12; // Data, Nome, Gravidade, Cidade, Classificação, Municipio, Especialidade, Diagnostico, Prontuario, Sexo, Cor, Idade
+    const NUM_COLS = 12; 
     const DATE_RE = /^\d{2}\/\d{2}\/\d{4}$/;
-    const HEADER_FINAL = ["Data Atendimento", "Nome Paciente", "Gravidade", "Cidade de Origem", "Classificação de Risco", "Municipio", "Especialidade", "Diagnostico", "Prontuario", "Sexo", "Cor"];
+    const HEADER_FINAL = ["Data Atendimento", "Nome Paciente", "Gravidade", "Cidade de Origem", "Classificacão de Risco", "Municipio", "Especialidade", "Diagnostico", "Prontuario", "Sexo", "Cor", "Idade"];
+
+    function cleanCellText(text) {
+        if (!text) return '';
+        let words = text.split(/\s+/);
+        
+        let uniqueWords = [];
+        for (let i = 0; i < words.length; i++) {
+            if (words[i] === words[i + 1]) {
+                continue;
+            }
+            uniqueWords.push(words[i]);
+        }
+        
+        if (uniqueWords.length % 2 === 0) {
+            let half = uniqueWords.length / 2;
+            let firstHalf = uniqueWords.slice(0, half).join(' ');
+            let secondHalf = uniqueWords.slice(half).join(' ');
+            if (firstHalf === secondHalf) {
+                return firstHalf;
+            }
+        }
+        
+        return uniqueWords.join(' ');
+    }
 
     function colIndex(x) {
         for (let i = 0; i < NUM_COLS; i++) {
@@ -124,33 +139,41 @@
                 const viewport = page.getViewport({ scale: 1 });
                 const textContent = await page.getTextContent();
 
-                // Posiciona cada fragmento de texto no espaço visual da página (já considerando rotação)
                 const words = [];
                 for (const item of textContent.items) {
                     const str = (item.str || '').trim();
                     if (!str) continue;
                     const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
-                    words.push({ text: str, x: tx[4], y: tx[5] });
+                    const x = tx[4];
+                    const y = tx[5];
+
+                    const isDuplicateGeom = words.some(w => 
+                        w.text === str && Math.abs(w.x - x) < 0.5 && Math.abs(w.y - y) < 0.5
+                    );
+
+                    if (!isDuplicateGeom) {
+                        words.push({ text: str, x, y });
+                    }
                 }
 
-                // Âncoras de linha: valores de data isolados na coluna 0 (Data Atendimento)
-                const anchors = words
+                const headerAnchors = words
                     .filter(w => DATE_RE.test(w.text) && colIndex(w.x) === 0)
-                    .map(w => w.y)
-                    .sort((a, b) => a - b);
+                    .sort((a, b) => a.y - b.y);
 
-                if (anchors.length === 0) continue; // página sem tabela de dados (ex: tabela-resumo "Table 2")
+                if (headerAnchors.length === 0) continue;
 
-                // Limite inferior: rodapé do relatório ou início do resumo "Total de Registros"
                 const stopWords = words.filter(w =>
                     w.text.includes('EMERG_GERA_RELATORIOS') || w.text.includes('Registros:')
                 );
                 const cutoff = stopWords.length ? Math.min(...stopWords.map(w => w.y)) : Infinity;
-                anchors.push(cutoff);
 
-                for (let ri = 0; ri < anchors.length - 1; ri++) {
-                    const top = anchors[ri] - 1;
-                    const bot = anchors[ri + 1] - 1;
+                for (let ri = 0; ri < headerAnchors.length; ri++) {
+                    const currentY = headerAnchors[ri].y;
+                    const top = currentY - 2;
+                    let bot = (ri + 1 < headerAnchors.length) ? headerAnchors[ri + 1].y - 2 : cutoff;
+                    
+                    if (bot > cutoff) bot = cutoff;
+
                     const rowWords = words.filter(w => w.y >= top && w.y < bot);
 
                     const cols = Array.from({ length: NUM_COLS }, () => []);
@@ -161,10 +184,10 @@
 
                     const cellVals = cols.map(c => {
                         c.sort((a, b) => (Math.round(a.y) - Math.round(b.y)) || (a.x - b.x));
-                        return c.map(w => w.text).join(' ').trim();
+                        let rawText = c.map(w => w.text).join(' ').trim();
+                        return cleanCellText(rawText);
                     });
 
-                    // Descarta linhas incompletas (sem diagnóstico preenchido)
                     if (!cellVals[7]) {
                         skippedEmptyDiag++;
                         continue;
@@ -175,20 +198,34 @@
             }
 
             if (allRows.length === 0) {
-                throw new Error('Nenhum registro de atendimento foi encontrado neste PDF. Verifique se é um relatório Aghuse no formato esperado.');
+                throw new Error('Nenhum registro de atendimento válido foi extraído.');
             }
 
-            // ---- Monta dados finais: iniciais do nome + remove coluna Idade (a última) ----
             const dadosFinais = [HEADER_FINAL];
             for (const row of allRows) {
                 const nome = row[1] || '';
                 const inicial = nome.length > 0 ? nome.trim().charAt(0).toUpperCase() : '';
-                const prontuarioRaw = row[8];
+                
+                let prontuarioRaw = row[8] ? row[8].split(' ')[0] : '';
                 const prontuario = /^\d+$/.test(prontuarioRaw) ? Number(prontuarioRaw) : prontuarioRaw;
+
+                let sexo = row[9] ? row[9].split(' ')[0] : '';
+                let cor = row[10] ? row[10].split(' ')[0] : '';
+
+                // Tratamento definitivo e isolamento da coluna de Idade
+                let idadeOriginal = row[11] || '';
+                let idadeLimpa = idadeOriginal;
+                if (idadeOriginal.includes('dias')) {
+                    // Divide no primeiro "dias" encontrado e adiciona a palavra de volta
+                    let partesIdade = idadeOriginal.split('dias');
+                    if (partesIdade.length > 1) {
+                        idadeLimpa = partesIdade[0].trim() + ' dias';
+                    }
+                }
 
                 dadosFinais.push([
                     row[0],       // Data Atendimento
-                    inicial,      // Nome Paciente (apenas inicial)
+                    inicial,      // Nome Paciente
                     row[2],       // Gravidade
                     row[3],       // Cidade de Origem
                     row[4],       // Classificação de Risco
@@ -196,12 +233,12 @@
                     row[6],       // Especialidade
                     row[7],       // Diagnostico
                     prontuario,   // Prontuario
-                    row[9],       // Sexo
-                    row[10]       // Cor  (coluna Idade / row[11] é descartada)
+                    sexo,         // Sexo
+                    cor,          // Cor
+                    idadeLimpa    // Idade (Isolada com Sucesso!)
                 ]);
             }
 
-            // ---- Gera planilha Excel ----
             const wb = XLSX.utils.book_new();
             const ws = XLSX.utils.aoa_to_sheet(dadosFinais);
 
@@ -214,10 +251,9 @@
             ws['!cols'] = [
                 { wch: 18 }, { wch: 14 }, { wch: 12 }, { wch: 18 },
                 { wch: 28 }, { wch: 14 }, { wch: 22 }, { wch: 45 },
-                { wch: 12 }, { wch: 11 }, { wch: 10 }
+                { wch: 12 }, { wch: 11 }, { wch: 10 }, { wch: 25 }
             ];
 
-            // Estilo (compatível com builds que suportam escrita de estilo; ignorado silenciosamente caso contrário)
             const thinBorder = { style: 'thin', color: { rgb: '000000' } };
             const range = XLSX.utils.decode_range(ws['!ref']);
             for (let R = range.s.r; R <= range.e.r; R++) {
@@ -255,7 +291,7 @@
         const url = window.URL.createObjectURL(blobExcel);
         const a = document.createElement('a');
         a.href = url;
-        a.download = 'Relatorio_Aghuse_MP.xlsx';
+        a.download = 'como a planilha tem que ficar.xlsx';
         document.body.appendChild(a);
         a.click();
         window.URL.revokeObjectURL(url);
